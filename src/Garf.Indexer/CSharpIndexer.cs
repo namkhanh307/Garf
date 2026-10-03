@@ -38,6 +38,7 @@ public static class CSharpIndexer
         var symbolIds = new Dictionary<ISymbol, string>(SymbolEqualityComparer.Default);
         var nameSet = new HashSet<string>(StringComparer.Ordinal);
         var declarationSpans = new Dictionary<string, List<TextSpan>>(StringComparer.Ordinal);
+        var declarationIds = new Dictionary<SyntaxNode, string>();
 
         foreach (var parsed in parsedFiles)
         {
@@ -69,15 +70,111 @@ public static class CSharpIndexer
 
                 symbols.Add(def);
                 symbolIds.Add(symbol, id);
+                declarationIds.Add(candidate.Node, id);
                 nameSet.Add(candidate.Name);
             }
         }
 
-        var references = new List<SymbolRef>();
+        var edges = new List<SymbolEdge>();
+        var seenEdges = new HashSet<(string Source, string Target, string Kind, string File, int Line, int Column)>();
+
         foreach (var parsed in parsedFiles)
         {
             var model = compilation.GetSemanticModel(parsed.Tree);
             var spans = declarationSpans[parsed.File];
+            var typedSpans = new HashSet<TextSpan>();
+
+            void AddEdge(string kind, string target, string name, TextSpan span, string source)
+            {
+                var line = parsed.Tree.GetLineSpan(span).StartLinePosition;
+                var file = parsed.File;
+                var lineNumber = line.Line + 1;
+                var column = line.Character + 1;
+                var key = (source, target, kind, file, lineNumber, column);
+                if (!seenEdges.Add(key))
+                {
+                    return;
+                }
+
+                edges.Add(new SymbolEdge(
+                    source,
+                    target,
+                    kind,
+                    name,
+                    file,
+                    lineNumber,
+                    column,
+                    Snippets.FromLines(parsed.Lines, line.Line, afterLines: 2)));
+            }
+
+            string Source(SyntaxNode node)
+                => node.Ancestors().FirstOrDefault(declarationIds.ContainsKey) is { } declaration
+                    ? declarationIds[declaration]
+                    : "";
+
+            foreach (var invocation in parsed.Tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (CalledName(invocation) is not { } called)
+                {
+                    continue;
+                }
+
+                var target = ResolveTarget(model.GetSymbolInfo(invocation).Symbol, symbolIds);
+                if (target is null)
+                {
+                    continue;
+                }
+
+                typedSpans.Add(called.Span);
+                AddEdge("calls", target, called.Name, called.Span, Source(invocation));
+            }
+
+            foreach (var creation in parsed.Tree.GetRoot().DescendantNodes().OfType<ObjectCreationExpressionSyntax>())
+            {
+                var target = ResolveTarget(model.GetSymbolInfo(creation.Type).Symbol, symbolIds)
+                    ?? ResolveTarget(model.GetTypeInfo(creation.Type).Type, symbolIds);
+                if (target is null)
+                {
+                    continue;
+                }
+
+                typedSpans.Add(creation.Type.Span);
+                AddEdge("instantiates", target, creation.Type.ToString(), creation.Type.Span, Source(creation));
+            }
+
+            foreach (var baseType in parsed.Tree.GetRoot().DescendantNodes().OfType<BaseTypeSyntax>())
+            {
+                var symbol = model.GetSymbolInfo(baseType.Type).Symbol
+                    ?? model.GetTypeInfo(baseType.Type).Type;
+                var target = ResolveTarget(symbol, symbolIds);
+                if (target is null)
+                {
+                    continue;
+                }
+
+                var kind = symbol is INamedTypeSymbol { TypeKind: TypeKind.Interface }
+                    ? "implements"
+                    : "extends";
+                typedSpans.Add(baseType.Type.Span);
+                AddEdge(kind, target, baseType.Type.ToString(), baseType.Type.Span, Source(baseType));
+            }
+
+            foreach (var usingDirective in parsed.Tree.GetRoot().DescendantNodes().OfType<UsingDirectiveSyntax>())
+            {
+                if (usingDirective.Name is null)
+                {
+                    continue;
+                }
+
+                var target = ResolveTarget(model.GetSymbolInfo(usingDirective.Name).Symbol, symbolIds);
+                if (target is null)
+                {
+                    continue;
+                }
+
+                typedSpans.Add(usingDirective.Name.Span);
+                AddEdge("imports", target, usingDirective.Name.ToString(), usingDirective.Name.Span, "");
+            }
 
             foreach (var simple in parsed.Tree.GetRoot().DescendantNodes().OfType<SimpleNameSyntax>())
             {
@@ -92,25 +189,24 @@ public static class CSharpIndexer
                     continue;
                 }
 
-                var symbol = model.GetSymbolInfo(simple).Symbol
-                    ?? model.GetTypeInfo(simple).Type as ISymbol;
-                if (symbol is null || !symbolIds.TryGetValue(symbol, out var target))
+                if (typedSpans.Any(span => span.Contains(simple.Span)))
                 {
                     continue;
                 }
 
-                var line = parsed.Tree.GetLineSpan(simple.Span).StartLinePosition;
-                references.Add(new SymbolRef(
-                    target,
-                    name,
-                    parsed.File,
-                    line.Line + 1,
-                    line.Character + 1,
-                    Snippets.FromLines(parsed.Lines, line.Line, afterLines: 2)));
+                var symbol = model.GetSymbolInfo(simple).Symbol
+                    ?? model.GetTypeInfo(simple).Type as ISymbol;
+                var target = ResolveTarget(symbol, symbolIds);
+                if (target is null)
+                {
+                    continue;
+                }
+
+                AddEdge("references", target, name, simple.Span, Source(simple));
             }
         }
 
-        return new IndexResult(symbols, references);
+        return new IndexResult(symbols, edges);
     }
 
     private static CSharpCompilation CreateCompilation(IEnumerable<SyntaxTree> trees)
@@ -191,6 +287,41 @@ public static class CSharpIndexer
         }
 
         return $"{Language}:{file}:{line}:{column}";
+    }
+
+    private static string? ResolveTarget(ISymbol? symbol, Dictionary<ISymbol, string> symbolIds)
+    {
+        if (symbol is null)
+        {
+            return null;
+        }
+
+        if (symbolIds.TryGetValue(symbol, out var id))
+        {
+            return id;
+        }
+
+        if (symbol is IMethodSymbol method && symbolIds.TryGetValue(method.OriginalDefinition, out id))
+        {
+            return id;
+        }
+
+        if (symbol is INamedTypeSymbol type && symbolIds.TryGetValue(type.OriginalDefinition, out id))
+        {
+            return id;
+        }
+
+        return null;
+    }
+
+    private static (string Name, TextSpan Span)? CalledName(InvocationExpressionSyntax invocation)
+    {
+        return invocation.Expression switch
+        {
+            MemberAccessExpressionSyntax member => (member.Name.Identifier.ValueText, member.Name.Span),
+            SimpleNameSyntax simple => (simple.Identifier.ValueText, simple.Span),
+            _ => null
+        };
     }
 
     private static IEnumerable<DeclarationCandidate> Declarations(ParsedFile parsed)

@@ -95,11 +95,13 @@ const program = ts.createProgram(files, options, ts.createCompilerHost(options))
 const checker = program.getTypeChecker();
 
 const symbols = [];
-const references = [];
+const edges = [];
 const nameSet = new Set();
 const declPos = new Set();
 const seenSymbols = new Set();
 const symbolToId = new Map();
+const declToId = new Map();
+const seenEdges = new Set();
 
 const resolveSymbol = (node) => {
   let symbol = checker.getSymbolAtLocation(node);
@@ -176,6 +178,7 @@ for (const file of files) {
 
     const id = symbolId(symbol, fileRel, line + 1, character + 1);
     if (symbol) symbolToId.set(symbol, id);
+    declToId.set(node, id);
 
     symbols.push({
       id,
@@ -223,34 +226,123 @@ for (const file of files) {
 for (const file of files) {
   const text = fs.readFileSync(file, 'utf8');
   const sf = program.getSourceFile(file) || ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
+  const lines = text.split(/\r?\n/);
   const fileRel = rel(file);
+  const typedNodes = [];
 
-  const visit = (node) => {
-    if (ts.isIdentifier(node)) {
-      const name = node.text;
-      if (nameSet.has(name)) {
-        const pos = node.getStart(sf);
-        if (!declPos.has(`${fileRel}:${pos}`)) {
-          const symbol = resolveSymbol(node);
-          const target = symbol ? symbolToId.get(symbol) : undefined;
-          if (target) {
-            const { line, character } = sf.getLineAndCharacterOfPosition(pos);
-            references.push({
-              target,
-              name,
-              file: fileRel,
-              line: line + 1,
-              column: character + 1,
-              snippet: ''
-            });
+  const targetId = (node) => {
+    const symbol = resolveSymbol(node);
+    return symbol ? symbolToId.get(symbol) : undefined;
+  };
+
+  const enclosingId = (node) => {
+    let current = node.parent;
+    while (current) {
+      const id = declToId.get(current);
+      if (id) return id;
+      current = current.parent;
+    }
+    return '';
+  };
+
+  const nodeName = (node) => {
+    if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node)) return node.getText(sf);
+    return node.getText(sf);
+  };
+
+  const emit = (kind, nameNode, target, source) => {
+    if (!target || !nameNode) return;
+    const pos = nameNode.getStart(sf);
+    const { line, character } = sf.getLineAndCharacterOfPosition(pos);
+    const lineNumber = line + 1;
+    const column = character + 1;
+    const key = [source, target, kind, fileRel, lineNumber, column].join('\u0000');
+    if (seenEdges.has(key)) return;
+    seenEdges.add(key);
+    typedNodes.push(nameNode);
+    edges.push({
+      source,
+      target,
+      kind,
+      name: nodeName(nameNode),
+      file: fileRel,
+      line: lineNumber,
+      column,
+      snippet: snippet(lines, line, 2)
+    });
+  };
+
+  const visitEdges = (node) => {
+    if (ts.isCallExpression(node)) {
+      const expression = node.expression;
+      let nameNode = null;
+      if (ts.isIdentifier(expression)) {
+        nameNode = expression;
+      } else if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.name)) {
+        nameNode = expression.name;
+      }
+      if (nameNode) {
+        emit('calls', nameNode, targetId(expression), enclosingId(node));
+      }
+    } else if (ts.isNewExpression(node)) {
+      emit('instantiates', node.expression, targetId(node.expression), enclosingId(node));
+    } else if (ts.isJsxSelfClosingElement(node)) {
+      emit('calls', node.tagName, targetId(node.tagName), enclosingId(node));
+    } else if (ts.isJsxElement(node)) {
+      const tagName = node.openingElement.tagName;
+      emit('calls', tagName, targetId(tagName), enclosingId(node));
+    } else if (ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node)) {
+      for (const clause of node.heritageClauses || []) {
+        const kind = clause.token === ts.SyntaxKind.ExtendsKeyword ? 'extends' : 'implements';
+        for (const heritageType of clause.types) {
+          emit(kind, heritageType.expression, targetId(heritageType.expression), declToId.get(node) || '');
+        }
+      }
+    } else if (ts.isImportDeclaration(node) && node.importClause) {
+      const clause = node.importClause;
+      if (clause.name) {
+        emit('imports', clause.name, targetId(clause.name), '');
+      }
+      if (clause.namedBindings) {
+        if (ts.isNamespaceImport(clause.namedBindings)) {
+          emit('imports', clause.namedBindings.name, targetId(clause.namedBindings.name), '');
+        } else if (ts.isNamedImports(clause.namedBindings)) {
+          for (const element of clause.namedBindings.elements) {
+            emit('imports', element.name, targetId(element.name), '');
+            if (element.propertyName && element.propertyName !== element.name) {
+              typedNodes.push(element.propertyName);
+            }
           }
         }
       }
     }
-    ts.forEachChild(node, visit);
+
+    ts.forEachChild(node, visitEdges);
   };
 
-  visit(sf);
+  visitEdges(sf);
+
+  const visitReferences = (node) => {
+    if (ts.isIdentifier(node)) {
+      const name = node.text;
+      if (nameSet.has(name)) {
+        const pos = node.getStart(sf);
+        const key = `${fileRel}:${pos}`;
+        const inTypedNode = typedNodes.some((typed) => {
+          const start = typed.getStart(sf);
+          const end = typed.getEnd();
+          return pos >= start && pos <= end;
+        });
+
+        if (!declPos.has(key) && !inTypedNode) {
+          emit('references', node, targetId(node), enclosingId(node));
+        }
+      }
+    }
+    ts.forEachChild(node, visitReferences);
+  };
+
+  visitReferences(sf);
 }
 
-fs.writeFileSync(out, JSON.stringify({ symbols, references }));
+fs.writeFileSync(out, JSON.stringify({ symbols, edges }));

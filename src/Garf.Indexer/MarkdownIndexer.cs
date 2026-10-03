@@ -19,7 +19,7 @@ public static class MarkdownIndexer
                 group => group.ToList(),
                 StringComparer.OrdinalIgnoreCase);
 
-        var references = new List<SymbolRef>();
+        var edges = new List<SymbolEdge>();
 
         foreach (var file in files)
         {
@@ -40,13 +40,13 @@ public static class MarkdownIndexer
                 {
                     foreach (var symbol in symbolsByName[name])
                     {
-                        references.Add(new SymbolRef(symbol.Id, symbol.Name, rel, i + 1, column, snippet));
+                        edges.Add(new SymbolEdge("", symbol.Id, "references", symbol.Name, rel, i + 1, column, snippet));
                     }
                 }
             }
         }
 
-        return new IndexResult(new List<SymbolDef>(), references);
+        return new IndexResult(new List<SymbolDef>(), edges);
     }
 
     private static IEnumerable<(string Name, int Column)> Mentions(
