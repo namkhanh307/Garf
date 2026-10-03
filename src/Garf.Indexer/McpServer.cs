@@ -15,6 +15,8 @@ public static class McpServer
         WriteIndented = false
     };
 
+    private static IndexWatcher? _watcher;
+
     private static readonly JsonArray Tools =
     [
         new JsonObject
@@ -45,6 +47,11 @@ public static class McpServer
                     {
                         ["type"] = "string",
                         ["description"] = "Path to ts-indexer/index.mjs. Auto-detected when omitted."
+                    },
+                    ["watch"] = new JsonObject
+                    {
+                        ["type"] = "boolean",
+                        ["description"] = "Keep the index fresh on file changes after indexing. Defaults to false."
                     }
                 },
                 ["required"] = new JsonArray("root")
@@ -229,7 +236,18 @@ public static class McpServer
         var output = GetString(arguments, "output") ?? "garf-index.json";
         var skipTs = GetBoolean(arguments, "skipTs", false);
         var tsIndexer = GetString(arguments, "tsIndexer") ?? Program.FindTsIndexer();
-        var summary = Program.IndexRepository(Path.GetFullPath(root), output, skipTs, tsIndexer);
+        var watch = GetBoolean(arguments, "watch", false);
+        var rootFull = Path.GetFullPath(root);
+        var outputFull = Path.GetFullPath(output);
+        var summary = Program.IndexRepository(rootFull, outputFull, skipTs, tsIndexer);
+        IndexCache.Invalidate(outputFull);
+
+        if (watch)
+        {
+            _watcher?.Dispose();
+            _watcher = new IndexWatcher(rootFull, outputFull, skipTs, tsIndexer, 250);
+            _watcher.Start();
+        }
 
         WriteToolResult(
             id,
@@ -249,7 +267,8 @@ public static class McpServer
         var limit = GetInt32(arguments, "limit", 10);
         var refLimit = GetInt32(arguments, "refs", 10);
 
-        var result = Program.QueryRepository(symbol, index, limit);
+        Program.EnsureFresh(index);
+        var result = IndexCache.Query(index, symbol, limit);
         var text = format == "json"
             ? JsonSerializer.Serialize(result, Json)
             : Program.RenderMarkdown(result, refLimit);

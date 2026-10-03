@@ -16,6 +16,16 @@ public static class Program
         PropertyNameCaseInsensitive = true
     };
 
+    private static readonly HashSet<string> SkippedDirectories = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bin", "obj", "node_modules", ".git", ".vs", ".idea", "dist", "build", "out", "coverage", ".next"
+    };
+
+    private static readonly HashSet<string> DocFolders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "doc", "docs", "documents"
+    };
+
     public static int Main(string[] args)
     {
         if (args.Length == 0)
@@ -27,6 +37,7 @@ public static class Program
         return args[0].ToLowerInvariant() switch
         {
             "index" => RunIndex(args[1..]),
+            "watch" => RunWatch(args[1..]),
             "query" => RunQuery(args[1..]),
             "mcp" => McpServer.Run(),
             "selftest" => RunSelfTest(),
@@ -41,6 +52,9 @@ public static class Program
 
             index <root> [--output garf-index.json] [--skip-ts] [--ts-indexer path]
               Scan a repo and write a symbol/edge index.
+
+            watch <root> [--output garf-index.json] [--skip-ts] [--ts-indexer path] [--debounce 250]
+              Index a repo, then re-index when relevant files change.
 
             query <symbol> [--index garf-index.json] [--format md|json] [--limit 10] [--refs 10]
               Return matching symbol definitions and their typed edges.
@@ -88,6 +102,7 @@ public static class Program
 
         var csFiles = Crawl(root, new[] { ".cs" });
         var result = CSharpIndexer.Index(csFiles, root);
+        var files = new List<string>(csFiles);
 
         if (!skipTs)
         {
@@ -100,6 +115,7 @@ public static class Program
                     result = new IndexResult(
                         result.Symbols.Concat(tsResult.Symbols).ToList(),
                         result.Edges.Concat(tsResult.Edges).ToList());
+                    files.AddRange(tsFiles);
                 }
             }
         }
@@ -111,9 +127,24 @@ public static class Program
             result = new IndexResult(
                 result.Symbols,
                 result.Edges.Concat(docResult.Edges).ToList());
+            files.AddRange(docFiles);
         }
 
-        var document = new IndexDocument(3, result.Symbols, result.Edges);
+        var fileMeta = files
+            .Select(file => new IndexFile(
+                Path.GetRelativePath(root, file),
+                new FileInfo(file).Length,
+                new DateTimeOffset(File.GetLastWriteTimeUtc(file))))
+            .ToList();
+
+        var document = new IndexDocument(
+            4,
+            root,
+            skipTs,
+            tsIndexer,
+            fileMeta,
+            result.Symbols,
+            result.Edges);
         File.WriteAllText(output, JsonSerializer.Serialize(document, WriteJson));
 
         return new IndexSummary(output, result.Symbols.Count, result.Edges.Count);
@@ -129,6 +160,7 @@ public static class Program
 
         try
         {
+            EnsureFresh(indexFile);
             var result = QueryRepository(query, indexFile, limit);
 
             if (format == "json")
@@ -160,7 +192,14 @@ public static class Program
         }
 
         var document = JsonSerializer.Deserialize<IndexDocument>(File.ReadAllText(indexFile), ReadJson)
-            ?? new IndexDocument(3, new List<SymbolDef>(), new List<SymbolEdge>());
+            ?? new IndexDocument(
+                4,
+                null,
+                false,
+                null,
+                new List<IndexFile>(),
+                new List<SymbolDef>(),
+                new List<SymbolEdge>());
 
         var symbols = document.Symbols ?? new List<SymbolDef>();
         var edges = document.Edges ?? new List<SymbolEdge>();
@@ -259,10 +298,6 @@ public static class Program
     private static string[] Crawl(string root, string[] extensions)
     {
         var wanted = new HashSet<string>(extensions.Select(e => e.ToLowerInvariant()), StringComparer.OrdinalIgnoreCase);
-        var skipped = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "bin", "obj", "node_modules", ".git", ".vs", ".idea", "dist", "build", "out", "coverage", ".next"
-        };
 
         var options = new EnumerationOptions
         {
@@ -275,21 +310,12 @@ public static class Program
             .Where(f => wanted.Contains(Path.GetExtension(f)))
             .Where(f => !Path.GetRelativePath(root, f)
                 .Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                .Any(seg => skipped.Contains(seg)))
+                .Any(seg => SkippedDirectories.Contains(seg)))
             .ToArray();
     }
 
     private static string[] CrawlDocs(string root)
     {
-        var docFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "doc", "docs", "documents"
-        };
-        var skipped = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "bin", "obj", "node_modules", ".git", ".vs", ".idea", "dist", "build", "out", "coverage", ".next"
-        };
-
         var options = new EnumerationOptions
         {
             RecurseSubdirectories = true,
@@ -302,10 +328,152 @@ public static class Program
             {
                 var segments = Path.GetRelativePath(root, f)
                     .Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                return segments.Any(docFolders.Contains)
-                    && !segments.Any(skipped.Contains);
+                return segments.Any(DocFolders.Contains)
+                    && !segments.Any(SkippedDirectories.Contains);
             })
             .ToArray();
+    }
+
+    internal static bool EnsureFresh(string indexFile)
+    {
+        if (!File.Exists(indexFile))
+        {
+            throw new FileNotFoundException($"index not found: {indexFile}", indexFile);
+        }
+
+        var document = JsonSerializer.Deserialize<IndexDocument>(File.ReadAllText(indexFile), ReadJson);
+        if (document is null
+            || document.Version < 4
+            || string.IsNullOrWhiteSpace(document.Root)
+            || document.Files is null
+            || document.Files.Count == 0)
+        {
+            Console.Error.WriteLine(
+                "[garf] index lacks freshness metadata; run `index` to migrate (answering from existing index)");
+            return false;
+        }
+
+        var root = document.Root;
+        if (!Directory.Exists(root))
+        {
+            Console.Error.WriteLine("[garf] indexed root no longer exists; answering from existing index");
+            return false;
+        }
+
+        var current = ExpectedFiles(root, document.SkipTs, document.TsIndexer);
+        var stored = new Dictionary<string, IndexFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in document.Files)
+        {
+            stored[file.Path] = file;
+        }
+
+        var stale = current.Length != stored.Count;
+        if (!stale)
+        {
+            foreach (var file in current)
+            {
+                var rel = Path.GetRelativePath(root, file);
+                if (!stored.TryGetValue(rel, out var meta)
+                    || meta.Length != new FileInfo(file).Length
+                    || meta.LastWriteTimeUtc != new DateTimeOffset(File.GetLastWriteTimeUtc(file)))
+                {
+                    stale = true;
+                    break;
+                }
+            }
+        }
+
+        if (!stale)
+        {
+            return false;
+        }
+
+        Console.Error.WriteLine("[garf] index is stale; regenerating ...");
+        var summary = IndexRepository(root, indexFile, document.SkipTs, document.TsIndexer);
+        IndexCache.Invalidate(Path.GetFullPath(indexFile));
+        Console.Error.WriteLine(
+            $"indexed {summary.SymbolCount} symbols, {summary.EdgeCount} edges -> {summary.Output}");
+        return true;
+    }
+
+    private static string[] ExpectedFiles(string root, bool skipTs, string? tsIndexer)
+    {
+        var files = new List<string>();
+        files.AddRange(Crawl(root, new[] { ".cs" }));
+        if (!skipTs && tsIndexer is not null)
+        {
+            files.AddRange(Crawl(root, new[] { ".ts", ".tsx", ".jsx" }));
+        }
+
+        files.AddRange(CrawlDocs(root));
+        return files.ToArray();
+    }
+
+    internal static bool IsIndexedFile(string root, string fullPath)
+    {
+        if (HasSkippedSegment(root, fullPath))
+        {
+            return false;
+        }
+
+        var ext = Path.GetExtension(fullPath);
+        if (ext.Equals(".cs", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".ts", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".tsx", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".jsx", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (!ext.Equals(".md", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return Path.GetRelativePath(root, fullPath)
+            .Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(seg => DocFolders.Contains(seg));
+    }
+
+    private static bool HasSkippedSegment(string root, string fullPath)
+        => Path.GetRelativePath(root, fullPath)
+            .Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(seg => SkippedDirectories.Contains(seg));
+
+    private static int RunWatch(string[] args)
+    {
+        var rootArg = args.FirstOrDefault(a => !a.StartsWith("-", StringComparison.Ordinal)) ?? ".";
+        var output = GetOption(args, "--output", "-o") ?? "garf-index.json";
+        var skipTs = HasFlag(args, "--skip-ts");
+        var tsIndexer = GetOption(args, "--ts-indexer") ?? FindTsIndexer();
+        var debounce = ParseInt(GetOption(args, "--debounce"), 250);
+        var root = Path.GetFullPath(rootArg);
+
+        try
+        {
+            var summary = IndexRepository(root, output, skipTs, tsIndexer);
+            Console.WriteLine(
+                $"indexed {summary.SymbolCount} symbols, {summary.EdgeCount} edges -> {summary.Output}");
+        }
+        catch (DirectoryNotFoundException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+
+        using var watcher = new IndexWatcher(root, output, skipTs, tsIndexer, debounce);
+        watcher.Start();
+        Console.WriteLine($"watching {root} — press Ctrl+C to exit");
+
+        using var exit = new ManualResetEventSlim(false);
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            exit.Set();
+        };
+        exit.Wait();
+        Console.WriteLine("watch stopped");
+        return 0;
     }
 
     private static List<SymbolDef> Match(List<SymbolDef> symbols, string query, int limit)
@@ -534,6 +702,99 @@ public static class Program
                 docEdges.Count(e => e.Kind == "references" && e.Source == "" && e.Name == "Add") >= addSymbols.Count,
                 "markdown Add mention should target every matching Add symbol");
 
+            var cacheIndex = Path.Combine(dir, "cache.json");
+            File.WriteAllText(
+                cacheIndex,
+                JsonSerializer.Serialize(
+                    new IndexDocument(4, dir, false, null, new List<IndexFile>(), result.Symbols, result.Edges),
+                    WriteJson));
+
+            var cacheLoadBefore = IndexCache.LoadCount;
+            var cachedCalculator = IndexCache.Query(cacheIndex, "Calculator", 10);
+            var cacheLoadAfterFirst = IndexCache.LoadCount;
+            Assert(cacheLoadAfterFirst == cacheLoadBefore + 1, "cache should load on first query");
+            AssertQueryEquals(QueryRepository("Calculator", cacheIndex, 10), cachedCalculator);
+
+            var cachedAdd = IndexCache.Query(cacheIndex, "Add", 10);
+            AssertQueryEquals(QueryRepository("Add", cacheIndex, 10), cachedAdd);
+            Assert(IndexCache.LoadCount == cacheLoadAfterFirst, "subsequent queries should hit the cache");
+
+            File.WriteAllText(
+                cacheIndex,
+                JsonSerializer.Serialize(
+                    new IndexDocument(
+                        4,
+                        dir,
+                        false,
+                        null,
+                        new List<IndexFile>(),
+                        new List<SymbolDef>
+                        {
+                            new(
+                                "rewritten",
+                                "Rewritten",
+                                "class",
+                                "csharp",
+                                "Demo.Rewritten",
+                                "Rewritten.cs",
+                                1,
+                                1,
+                                "public class Rewritten",
+                                "public class Rewritten { }")
+                        },
+                        new List<SymbolEdge>()),
+                    WriteJson));
+
+            var loadBeforeRewrite = IndexCache.LoadCount;
+            var rewritten = IndexCache.Query(cacheIndex, "Rewritten", 10);
+            Assert(IndexCache.LoadCount == loadBeforeRewrite + 1, "cache should reload after rewrite");
+            Assert(rewritten.Matches.Count == 1, "rewritten symbol should be returned");
+            Assert(
+                IndexCache.Query(cacheIndex, "Calculator", 10).Matches.Count == 0,
+                "old symbol should no longer match after rewrite");
+
+            var freshRoot = Path.Combine(dir, "fresh");
+            Directory.CreateDirectory(freshRoot);
+            var freshFile = Path.Combine(freshRoot, "One.cs");
+            File.WriteAllText(freshFile, "public class One {}");
+            var freshIndex = Path.Combine(dir, "fresh.json");
+            IndexRepository(freshRoot, freshIndex, skipTs: true, tsIndexer: null);
+            Assert(!EnsureFresh(freshIndex), "fresh index should not rebuild");
+
+            File.AppendAllText(freshFile, "\npublic class Two {}\n");
+            Assert(EnsureFresh(freshIndex), "modified file should trigger rebuild");
+            Assert(QueryRepository("Two", freshIndex, 10).Matches.Count == 1, "new symbol missing after rebuild");
+
+            var thirdFile = Path.Combine(freshRoot, "Three.cs");
+            File.WriteAllText(thirdFile, "public class Three {}");
+            Assert(EnsureFresh(freshIndex), "added file should trigger rebuild");
+            Assert(QueryRepository("Three", freshIndex, 10).Matches.Count == 1, "added file symbol missing");
+
+            File.Delete(thirdFile);
+            Assert(EnsureFresh(freshIndex), "deleted file should trigger rebuild");
+            Assert(QueryRepository("Three", freshIndex, 10).Matches.Count == 0, "deleted file symbol should be gone");
+
+            var legacyIndex = Path.Combine(dir, "legacy.json");
+            File.WriteAllText(
+                legacyIndex,
+                JsonSerializer.Serialize(
+                    new { version = 3, symbols = result.Symbols, edges = result.Edges },
+                    WriteJson));
+            Assert(!EnsureFresh(legacyIndex), "legacy index should not auto-rebuild");
+
+            var missingIndex = Path.Combine(dir, "missing.json");
+            var missingThrew = false;
+            try
+            {
+                IndexCache.Query(missingIndex, "Calculator", 10);
+            }
+            catch (FileNotFoundException)
+            {
+                missingThrew = true;
+            }
+
+            Assert(missingThrew, "querying a missing index should throw FileNotFoundException");
+
             var tsIndexer = FindTsIndexer();
             if (tsIndexer is not null && NodeAvailable())
             {
@@ -618,6 +879,19 @@ public static class Program
         }
     }
 
+    private static void AssertQueryEquals(QueryResult expected, QueryResult actual)
+    {
+        Assert(expected.Query == actual.Query, "query result query differs");
+        Assert(expected.Matches.Count == actual.Matches.Count, "query result match count differs");
+        for (var i = 0; i < expected.Matches.Count; i++)
+        {
+            Assert(expected.Matches[i].Symbol == actual.Matches[i].Symbol, "query result symbol differs");
+            Assert(
+                expected.Matches[i].Edges.SequenceEqual(actual.Matches[i].Edges),
+                "query result edges differ");
+        }
+    }
+
     private static string? GetOption(string[] args, params string[] names)
     {
         for (var i = 0; i < args.Length - 1; i++)
@@ -659,7 +933,15 @@ public sealed record SymbolEdge(
     int Column,
     string Snippet);
 public sealed record IndexResult(List<SymbolDef> Symbols, List<SymbolEdge> Edges);
-public sealed record IndexDocument(int Version, List<SymbolDef>? Symbols, List<SymbolEdge>? Edges);
+public sealed record IndexFile(string Path, long Length, DateTimeOffset LastWriteTimeUtc);
+public sealed record IndexDocument(
+    int Version,
+    string? Root,
+    bool SkipTs,
+    string? TsIndexer,
+    List<IndexFile>? Files,
+    List<SymbolDef>? Symbols,
+    List<SymbolEdge>? Edges);
 public sealed record IndexSummary(string Output, int SymbolCount, int EdgeCount);
 public sealed record SymbolMatch(SymbolDef Symbol, List<SymbolEdge> Edges);
 public sealed record QueryResult(string Query, List<SymbolMatch> Matches);

@@ -20,6 +20,7 @@ npm install
 # build + run from source
 dotnet run --project src\Garf.Indexer -- index <repo> -o index.json
 dotnet run --project src\Garf.Indexer -- query Calculate -i index.json -f md
+dotnet run --project src\Garf.Indexer -- watch <repo> -o index.json
 
 # or the built exe
 .\src\Garf.Indexer\bin\Debug\net10.0\garf.exe index <repo>
@@ -27,6 +28,7 @@ dotnet run --project src\Garf.Indexer -- query Calculate -i index.json -f md
 ```
 
 - `query` supports `--format md|json`, `--limit`, `--refs`.
+- `query` auto-rebuilds the index when it detects the source changed; `watch` keeps it fresh on file saves.
 - Markdown files under `doc`, `docs`, or `documents` folders are indexed as references, so `query <class>` also surfaces the doc block that describes it.
 - C# is indexed in-process with Roslyn; TS/TSX/JSX source files are indexed by
   	s-indexer\\index.mjs (skipped automatically if Node is unavailable). Plain .js/.mjs/.cjs build assets are ignored to avoid indexing minified bundles; source .ts/.tsx/.jsx files are indexed.
@@ -66,14 +68,15 @@ cwd = "C:\\path\\to\\Garf"
 
 Available tools:
 
-- `index` — scan `root` and write an index (`output`, `skipTs`, and `tsIndexer` are optional).
-- `query` — find `symbol` in an index (`index`, `format`, `limit`, and `refs` are optional).
+- `index` — scan `root` and write an index (`output`, `skipTs`, `tsIndexer`, and `watch` are optional).
+- `query` — find `symbol` in an index (`index`, `format`, `limit`, and `refs` are optional); auto-rebuilds a stale index.
 
-## Index schema (v3)
+## Index schema (v4)
 
-- `garf-index.json` contains `version: 3`, `symbols`, and `edges`.
+- `garf-index.json` contains `version: 4`, `root`, `skipTs`, `tsIndexer`, `files`, `symbols`, and `edges`.
+- `files` records each indexed file's relative `path`, `length`, and `lastWriteTimeUtc` so `query` can detect staleness.
 - Each `symbol` has a stable `id`, `name`, `kind`, `language`, `qualifiedName`, `signature`, `file`, `line`, `column`, and `snippet`.
 - Each `edge` has `source` (the containing symbol `id`, empty for file-level links), `target` (the exact symbol `id` it points to), `kind`, `name`, `file`, `line`, `column`, and `snippet`.
 - `kind` is one of `calls`, `instantiates`, `extends`, `implements`, `imports`, or `references`; `query` groups these into callers, callees, instantiations, base/derived types, imports, and references.
-- v3 is a breaking change. Regenerate existing indexes with `index`.
+- v4 is a breaking change. Regenerate existing indexes with `index`.
 
