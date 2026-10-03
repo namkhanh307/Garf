@@ -46,6 +46,13 @@ const scriptKind = (file) => {
   return ts.ScriptKind.TS;
 };
 
+const language = (file) => {
+  const ext = path.extname(file).toLowerCase();
+  if (ext === '.tsx') return 'tsx';
+  if (ext === '.jsx') return 'jsx';
+  return 'typescript';
+};
+
 const rel = (file) => path.relative(root, file).replaceAll('\\', '/');
 
 const snippet = (lines, line, afterLines = 2, maxChars = 500) => {
@@ -71,32 +78,115 @@ const hasJsx = (node) => {
   return found;
 };
 
+const files = walk(root);
+const options = {
+  noLib: true,
+  allowJs: true,
+  jsx: ts.JsxEmit.Preserve,
+  skipLibCheck: true,
+  module: ts.ModuleKind.ESNext,
+  moduleResolution: ts.ModuleResolutionKind.NodeNext,
+  target: ts.ScriptTarget.Latest,
+  noEmit: true,
+  types: []
+};
+
+const program = ts.createProgram(files, options, ts.createCompilerHost(options));
+const checker = program.getTypeChecker();
+
 const symbols = [];
 const references = [];
 const nameSet = new Set();
 const declPos = new Set();
+const seenSymbols = new Set();
+const symbolToId = new Map();
 
-// ponytail: name-based refs (AST identifiers only); may mix same-named symbols. Upgrade: TS checker/binder for exact symbol edges.
-for (const file of walk(root)) {
+const resolveSymbol = (node) => {
+  let symbol = checker.getSymbolAtLocation(node);
+  if (symbol && (symbol.flags & ts.SymbolFlags.Alias)) {
+    symbol = checker.getAliasedSymbol(symbol);
+  }
+  return symbol;
+};
+
+const fallbackId = (file, line, column) => `${language(file)}:${file}:${line}:${column}`;
+
+const symbolId = (symbol, file, line, column) => {
+  if (symbol) {
+    try {
+      const id = checker.getFullyQualifiedName(symbol);
+      if (id) return id;
+    } catch {
+      // Fall through to the location-based id.
+    }
+  }
+  return fallbackId(file, line, column);
+};
+
+const signatureFor = (node, nameNode) => {
+  try {
+    if (ts.isFunctionDeclaration(node)
+      || ts.isMethodDeclaration(node)
+      || ts.isMethodSignature(node)
+      || ts.isConstructorDeclaration(node)
+      || ts.isFunctionExpression(node)
+      || ts.isArrowFunction(node)
+      || ts.isCallSignatureDeclaration(node)
+      || ts.isConstructSignatureDeclaration(node)) {
+      const signature = checker.getSignatureFromDeclaration(node);
+      return signature ? checker.signatureToString(signature) : '';
+    }
+
+    if (ts.isVariableDeclaration(node)
+      || ts.isPropertyDeclaration(node)
+      || ts.isPropertySignature(node)
+      || ts.isGetAccessorDeclaration(node)
+      || ts.isSetAccessorDeclaration(node)
+      || ts.isTypeAliasDeclaration(node)) {
+      const type = checker.getTypeAtLocation(nameNode || node);
+      return type ? checker.typeToString(type) : '';
+    }
+  } catch {
+    // Signatures are best-effort; return empty when the checker cannot describe the node.
+  }
+  return '';
+};
+
+for (const file of files) {
   const text = fs.readFileSync(file, 'utf8');
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
+  const sf = program.getSourceFile(file) || ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
   const lines = text.split(/\r?\n/);
   const fileRel = rel(file);
 
   const add = (node, nameNode, kind) => {
-    if (!ts.isIdentifier(nameNode)) return;
+    if (!nameNode || !ts.isIdentifier(nameNode)) return;
     const name = nameNode.text;
     if (!name) return;
+
     const pos = nameNode.getStart(sf);
     const { line, character } = sf.getLineAndCharacterOfPosition(pos);
     declPos.add(`${fileRel}:${pos}`);
     nameSet.add(name);
+
+    const symbol = resolveSymbol(nameNode);
+    if (symbol) {
+      if (seenSymbols.has(symbol)) return;
+      seenSymbols.add(symbol);
+    }
+
+    const id = symbolId(symbol, fileRel, line + 1, character + 1);
+    if (symbol) symbolToId.set(symbol, id);
+
     symbols.push({
+      id,
       name,
       kind,
+      language: language(file),
+      qualifiedName: id,
       file: fileRel,
       line: line + 1,
       column: character + 1,
+      signature: signatureFor(node, nameNode),
       snippet: snippet(lines, line, 5)
     });
   };
@@ -113,16 +203,14 @@ for (const file of walk(root)) {
     else if (ts.isPropertyDeclaration(node) && node.name) add(node, node.name, 'property');
     else if (ts.isGetAccessor(node) && node.name) add(node, node.name, 'getter');
     else if (ts.isSetAccessor(node) && node.name) add(node, node.name, 'setter');
-    else if (ts.isConstructorDeclaration(node)) {
-      // no identifier; children are still visited below.
-    } else if (ts.isVariableStatement(node)) {
+    else if (ts.isVariableStatement(node)) {
       for (const decl of node.declarationList.declarations) {
         if (!ts.isIdentifier(decl.name)) continue;
         const initializer = decl.initializer;
         const kind = initializer && hasJsx(initializer) ? 'component'
           : initializer && isFunctionLike(initializer) ? 'function'
           : 'variable';
-        add(node, decl.name, kind);
+        add(decl, decl.name, kind);
       }
     }
 
@@ -132,11 +220,9 @@ for (const file of walk(root)) {
   visit(sf);
 }
 
-// ponytail: name-based refs (AST identifiers only); may mix same-named symbols. Upgrade: TS checker/binder for exact symbol edges.
-for (const file of walk(root)) {
+for (const file of files) {
   const text = fs.readFileSync(file, 'utf8');
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
-  const lines = text.split(/\r?\n/);
+  const sf = program.getSourceFile(file) || ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
   const fileRel = rel(file);
 
   const visit = (node) => {
@@ -145,14 +231,19 @@ for (const file of walk(root)) {
       if (nameSet.has(name)) {
         const pos = node.getStart(sf);
         if (!declPos.has(`${fileRel}:${pos}`)) {
-          const { line, character } = sf.getLineAndCharacterOfPosition(pos);
-          references.push({
-            name,
-            file: fileRel,
-            line: line + 1,
-            column: character + 1,
-            snippet: ''
-          });
+          const symbol = resolveSymbol(node);
+          const target = symbol ? symbolToId.get(symbol) : undefined;
+          if (target) {
+            const { line, character } = sf.getLineAndCharacterOfPosition(pos);
+            references.push({
+              target,
+              name,
+              file: fileRel,
+              line: line + 1,
+              column: character + 1,
+              snippet: ''
+            });
+          }
         }
       }
     }
@@ -163,9 +254,3 @@ for (const file of walk(root)) {
 }
 
 fs.writeFileSync(out, JSON.stringify({ symbols, references }));
-
-
-
-
-
-

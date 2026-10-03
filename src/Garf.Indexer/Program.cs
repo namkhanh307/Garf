@@ -91,7 +91,7 @@ public static class Program
                 result.References.Concat(docResult.References).ToList());
         }
 
-        var document = new IndexDocument(result.Symbols, result.References);
+        var document = new IndexDocument(2, result.Symbols, result.References);
         File.WriteAllText(output, JsonSerializer.Serialize(document, WriteJson));
 
         Console.WriteLine(
@@ -114,7 +114,7 @@ public static class Program
         }
 
         var document = JsonSerializer.Deserialize<IndexDocument>(File.ReadAllText(indexFile), ReadJson)
-            ?? new IndexDocument(new List<SymbolDef>(), new List<SymbolRef>());
+            ?? new IndexDocument(2, new List<SymbolDef>(), new List<SymbolRef>());
 
         var symbols = document.Symbols ?? new List<SymbolDef>();
         var references = document.References ?? new List<SymbolRef>();
@@ -123,7 +123,7 @@ public static class Program
             .Select(symbol => new SymbolMatch(
                 symbol,
                 references
-                    .Where(r => string.Equals(r.Name, symbol.Name, StringComparison.OrdinalIgnoreCase))
+                    .Where(r => string.Equals(r.Target, symbol.Id, StringComparison.Ordinal))
                     .OrderBy(r => r.File, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(r => r.Line)
                     .Take(refLimit)
@@ -184,6 +184,33 @@ public static class Program
         finally
         {
             try { File.Delete(temp); } catch { }
+        }
+    }
+
+    private static bool NodeAvailable()
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo("node")
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            startInfo.ArgumentList.Add("--version");
+
+            using var process = Process.Start(startInfo);
+            if (process is null)
+            {
+                return false;
+            }
+
+            process.WaitForExit();
+            return process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -291,6 +318,9 @@ public static class Program
         {
             Console.WriteLine();
             Console.WriteLine($"## {match.Symbol.Name} ({match.Symbol.Kind}) — {match.Symbol.File}:{match.Symbol.Line}");
+            Console.WriteLine($"- `language` {match.Symbol.Language}");
+            Console.WriteLine($"- `qualifiedName` {match.Symbol.QualifiedName}");
+            Console.WriteLine($"- `signature` {match.Symbol.Signature}");
             Console.WriteLine("```");
             Console.WriteLine(match.Symbol.Snippet);
             Console.WriteLine("```");
@@ -319,12 +349,18 @@ public static class Program
                     public int Add(int a, int b) => a + b;
                 }
 
+                public static class Formatter
+                {
+                    public static string Add(string left, string right) => left + right;
+                }
+
                 public static class Program
                 {
                     public static void Main()
                     {
                         var calc = new Calculator();
                         _ = calc.Add(1, 2);
+                        _ = Formatter.Add("a", "b");
                     }
                 }
                 """);
@@ -335,7 +371,31 @@ public static class Program
             Assert(names.Contains("Calculator"), "Calculator symbol missing");
             Assert(names.Contains("Add"), "Add symbol missing");
             Assert(result.References.Any(r => r.Name == "Calculator"), "Calculator reference missing");
-            Assert(result.References.Any(r => r.Name == "Add"), "Add reference missing");
+
+            var addSymbols = result.Symbols.Where(s => s.Name == "Add").ToList();
+            Assert(addSymbols.Count >= 2, "two distinct Add symbols expected");
+            Assert(
+                addSymbols.Select(s => s.Id).Distinct(StringComparer.Ordinal).Count() == addSymbols.Count,
+                "Add symbols must have distinct ids");
+
+            var addRefs = result.References.Where(r => r.Name == "Add").ToList();
+            Assert(addRefs.Count == 2, "two Add call sites expected");
+            foreach (var addSymbol in addSymbols)
+            {
+                Assert(addRefs.Any(r => r.Target == addSymbol.Id), "Add call site missing exact target");
+            }
+
+            Assert(
+                addRefs.All(r => addSymbols.Any(s => s.Id == r.Target)),
+                "Add reference resolved to an unknown target");
+            Assert(
+                addRefs.Select(r => r.Target).Distinct(StringComparer.Ordinal).Count() == 2,
+                "Add references should point to two different Add symbols");
+
+            var calculator = result.Symbols.First(s => s.Name == "Calculator");
+            Assert(calculator.Language == "csharp", "C# symbol language should be csharp");
+            Assert(!string.IsNullOrWhiteSpace(calculator.QualifiedName), "C# symbol missing qualifiedName");
+            Assert(!string.IsNullOrWhiteSpace(calculator.Signature), "C# symbol missing signature");
 
             var docsDir = Path.Combine(dir, "docs");
             Directory.CreateDirectory(docsDir);
@@ -348,8 +408,53 @@ public static class Program
             Assert(Path.GetFileName(docFiles[0]) == "Calculator.md", "docs md file missing");
 
             var docRefs = MarkdownIndexer.Index(docFiles, dir, result.Symbols).References;
-            Assert(docRefs.Any(r => r.Name == "Calculator" && r.File.Contains("Calculator.md")), "markdown Calculator reference missing");
+            Assert(
+                docRefs.Any(r => r.Name == "Calculator" && r.File.Contains("Calculator.md") && r.Target == calculator.Id),
+                "markdown Calculator reference missing exact target");
             Assert(docRefs.Any(r => r.Name == "Add" && r.File.Contains("Calculator.md")), "markdown Add reference missing");
+            Assert(
+                docRefs.Count(r => r.Name == "Add") >= addSymbols.Count,
+                "markdown Add mention should target every matching Add symbol");
+
+            var tsIndexer = FindTsIndexer();
+            if (tsIndexer is not null && NodeAvailable())
+            {
+                File.WriteAllText(Path.Combine(dir, "BoxA.tsx"), """
+                    export function Box() { return <div>A</div>; }
+                    export function UseA() { return <Box />; }
+                    """);
+                File.WriteAllText(Path.Combine(dir, "BoxB.tsx"), """
+                    export function Box() { return <div>B</div>; }
+                    export function UseB() { return <Box />; }
+                    """);
+
+                var tsResult = RunTsIndexer(tsIndexer, dir);
+                Assert(tsResult is not null, "TS indexer should return a result");
+
+                var boxSymbols = tsResult!.Symbols.Where(s => s.Name == "Box").ToList();
+                Assert(boxSymbols.Count >= 2, "two Box symbols expected");
+                Assert(
+                    boxSymbols.Select(s => s.Id).Distinct(StringComparer.Ordinal).Count() == boxSymbols.Count,
+                    "Box symbols must have distinct ids");
+                Assert(boxSymbols.All(s => s.Language == "tsx"), "TSX symbol language should be tsx");
+                Assert(boxSymbols.All(s => !string.IsNullOrWhiteSpace(s.QualifiedName)), "TSX symbol missing qualifiedName");
+                Assert(boxSymbols.All(s => !string.IsNullOrWhiteSpace(s.Signature)), "TSX symbol missing signature");
+
+                var boxRefs = tsResult.References.Where(r => r.Name == "Box").ToList();
+                Assert(boxRefs.Count >= 2, "two Box references expected");
+                foreach (var box in boxSymbols)
+                {
+                    Assert(boxRefs.Any(r => r.Target == box.Id), "Box reference missing exact target");
+                }
+
+                Assert(
+                    boxRefs.All(r => boxSymbols.Any(s => s.Id == r.Target)),
+                    "Box reference resolved to an unknown target");
+            }
+            else
+            {
+                Console.WriteLine("[garf] selftest: skipping TS assertions (Node.js unavailable)");
+            }
 
             Console.WriteLine("selftest ok");
             return 0;
@@ -388,10 +493,20 @@ public static class Program
         => int.TryParse(value, out var parsed) ? parsed : fallback;
 }
 
-public sealed record SymbolDef(string Name, string Kind, string File, int Line, int Column, string Snippet);
-public sealed record SymbolRef(string Name, string File, int Line, int Column, string Snippet);
+public sealed record SymbolDef(
+    string Id,
+    string Name,
+    string Kind,
+    string Language,
+    string QualifiedName,
+    string File,
+    int Line,
+    int Column,
+    string Signature,
+    string Snippet);
+public sealed record SymbolRef(string Target, string Name, string File, int Line, int Column, string Snippet);
 public sealed record IndexResult(List<SymbolDef> Symbols, List<SymbolRef> References);
-public sealed record IndexDocument(List<SymbolDef>? Symbols, List<SymbolRef>? References);
+public sealed record IndexDocument(int Version, List<SymbolDef>? Symbols, List<SymbolRef>? References);
 public sealed record SymbolMatch(SymbolDef Symbol, List<SymbolRef> References);
 public sealed record QueryResult(string Query, List<SymbolMatch> Matches);
 

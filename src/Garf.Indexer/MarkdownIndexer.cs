@@ -10,10 +10,14 @@ public static class MarkdownIndexer
 
     public static IndexResult Index(IEnumerable<string> files, string root, IEnumerable<SymbolDef> symbols)
     {
-        var names = symbols
+        var symbolList = symbols.ToList();
+        var symbolsByName = symbolList
             .Where(s => DocKinds.Contains(s.Kind))
-            .Select(s => s.Name)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            .GroupBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.ToList(),
+                StringComparer.OrdinalIgnoreCase);
 
         var references = new List<SymbolRef>();
 
@@ -25,7 +29,7 @@ public static class MarkdownIndexer
 
             for (var i = 0; i < lines.Length; i++)
             {
-                var mentions = Mentions(lines[i], names).ToList();
+                var mentions = Mentions(lines[i], symbolsByName.Keys).ToList();
                 if (mentions.Count == 0)
                 {
                     continue;
@@ -34,7 +38,10 @@ public static class MarkdownIndexer
                 var snippet = Snippets.FromLines(lines, i, afterLines: 4);
                 foreach (var (name, column) in mentions)
                 {
-                    references.Add(new SymbolRef(name, rel, i + 1, column, snippet));
+                    foreach (var symbol in symbolsByName[name])
+                    {
+                        references.Add(new SymbolRef(symbol.Id, symbol.Name, rel, i + 1, column, snippet));
+                    }
                 }
             }
         }
@@ -42,7 +49,9 @@ public static class MarkdownIndexer
         return new IndexResult(new List<SymbolDef>(), references);
     }
 
-    private static IEnumerable<(string Name, int Column)> Mentions(string line, IReadOnlySet<string> names)
+    private static IEnumerable<(string Name, int Column)> Mentions(
+        string line,
+        IEnumerable<string> names)
     {
         foreach (var name in names)
         {
