@@ -13,12 +13,13 @@ Guidance for contributing to **garf**, a minimal code indexer that scans a repos
 
 - `index` scans a repo, extracts symbol definitions and references, and writes a compact JSON index (`garf-index.json` by default).
 - `query` searches that index for a symbol and returns matching definitions plus their references as Markdown or JSON.
+- `mcp` runs a local Model Context Protocol server over stdio, exposing `index` and `query` as tools for AI agents.
 - C# is indexed in-process; TS/TSX/JSX are indexed by the Node helper and merged into the same index. Build assets and vendor directories are skipped.
 - Markdown files under `doc`, `docs`, or `documents` folders are indexed as references to the symbols they mention, so querying a class or namespace also surfaces its documentation.
 
 ## Project Structure & Module Organization
 
-- `src/Garf.Indexer/` — C# CLI. `Program.cs` parses commands, crawls files, runs querying, and defines the JSON records; `CSharpIndexer.cs` indexes C# using Roslyn; `MarkdownIndexer.cs` extracts symbol references from documentation Markdown.
+- `src/Garf.Indexer/` — C# CLI. `Program.cs` parses commands, crawls files, runs querying, and defines the JSON records; `CSharpIndexer.cs` indexes C# using Roslyn; `MarkdownIndexer.cs` extracts symbol references from documentation Markdown; `McpServer.cs` implements the local MCP stdio server.
 - `ts-indexer/` — Node.js helper. `index.mjs` indexes TS/JS/React using the TypeScript compiler API; `package.json` declares the `typescript` dependency.
 - Root files: `README.md` for usage and `.gitignore` for generated paths.
 - Generated `bin/`, `obj/`, and `node_modules/` directories are ignored and must not be committed.
@@ -35,6 +36,7 @@ Guidance for contributing to **garf**, a minimal code indexer that scans a repos
 - `dotnet build src\Garf.Indexer\Garf.Indexer.csproj` — compiles the CLI.
 - `dotnet run --project src\Garf.Indexer -- index <repo> -o index.json` — scans a repository and writes a symbol/reference index.
 - `dotnet run --project src\Garf.Indexer -- query <symbol> -i index.json -f md` — returns matching definitions and their references.
+- `dotnet run --project src\Garf.Indexer -- mcp` — starts the local MCP stdio server.
 - `dotnet run --project src\Garf.Indexer -- selftest` — runs the built-in C# indexer check.
 - `cd ts-indexer; npm install` — installs the TypeScript dependency for JS/TS indexing.
 

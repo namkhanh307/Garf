@@ -31,6 +31,44 @@ dotnet run --project src\Garf.Indexer -- query Calculate -i index.json -f md
 - C# is indexed in-process with Roslyn; TS/TSX/JSX source files are indexed by
   	s-indexer\\index.mjs (skipped automatically if Node is unavailable). Plain .js/.mjs/.cjs build assets are ignored to avoid indexing minified bundles; source .ts/.tsx/.jsx files are indexed.
 
+## MCP server
+
+Garf can run as a local Model Context Protocol (MCP) server over stdio, exposing
+`index` and `query` as tools for AI agents.
+
+```powershell
+dotnet run --project src\Garf.Indexer -- mcp
+# or the built exe
+.\src\Garf.Indexer\bin\Debug\net10.0\garf.exe mcp
+```
+
+Register it in an MCP client using the built exe:
+
+```json
+{
+  "mcpServers": {
+    "garf": {
+      "command": "C:\\path\\to\\Garf\\src\\Garf.Indexer\\bin\\Debug\\net10.0\\garf.exe",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Codex clients can add the same process to their MCP server configuration:
+
+```toml
+[mcp_servers.garf]
+command = "dotnet"
+args = ["run", "--project", "C:\\path\\to\\Garf\\src\\Garf.Indexer\\Garf.Indexer.csproj", "--", "mcp"]
+cwd = "C:\\path\\to\\Garf"
+```
+
+Available tools:
+
+- `index` — scan `root` and write an index (`output`, `skipTs`, and `tsIndexer` are optional).
+- `query` — find `symbol` in an index (`index`, `format`, `limit`, and `refs` are optional).
+
 ## Index schema (v3)
 
 - `garf-index.json` contains `version: 3`, `symbols`, and `edges`.

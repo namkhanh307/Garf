@@ -28,6 +28,7 @@ public static class Program
         {
             "index" => RunIndex(args[1..]),
             "query" => RunQuery(args[1..]),
+            "mcp" => McpServer.Run(),
             "selftest" => RunSelfTest(),
             _ => Usage()
         };
@@ -44,6 +45,9 @@ public static class Program
             query <symbol> [--index garf-index.json] [--format md|json] [--limit 10] [--refs 10]
               Return matching symbol definitions and their typed edges.
 
+            mcp
+              Run a local Model Context Protocol server over stdio.
+
             selftest
               Run the built-in C# indexer check.
             """);
@@ -56,12 +60,30 @@ public static class Program
         var output = GetOption(args, "--output", "-o") ?? "garf-index.json";
         var skipTs = HasFlag(args, "--skip-ts");
         var tsIndexer = GetOption(args, "--ts-indexer") ?? FindTsIndexer();
-        var root = Path.GetFullPath(rootArg);
 
+        try
+        {
+            var summary = IndexRepository(Path.GetFullPath(rootArg), output, skipTs, tsIndexer);
+            Console.WriteLine(
+                $"indexed {summary.SymbolCount} symbols, {summary.EdgeCount} edges -> {summary.Output}");
+            return 0;
+        }
+        catch (DirectoryNotFoundException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    internal static IndexSummary IndexRepository(
+        string root,
+        string output,
+        bool skipTs,
+        string? tsIndexer)
+    {
         if (!Directory.Exists(root))
         {
-            Console.Error.WriteLine($"root not found: {root}");
-            return 1;
+            throw new DirectoryNotFoundException($"root not found: {root}");
         }
 
         var csFiles = Crawl(root, new[] { ".cs" });
@@ -94,9 +116,7 @@ public static class Program
         var document = new IndexDocument(3, result.Symbols, result.Edges);
         File.WriteAllText(output, JsonSerializer.Serialize(document, WriteJson));
 
-        Console.WriteLine(
-            $"indexed {result.Symbols.Count} symbols, {result.Edges.Count} edges -> {output}");
-        return 0;
+        return new IndexSummary(output, result.Symbols.Count, result.Edges.Count);
     }
 
     private static int RunQuery(string[] args)
@@ -107,10 +127,36 @@ public static class Program
         var limit = ParseInt(GetOption(args, "--limit", "-n"), 10);
         var refLimit = ParseInt(GetOption(args, "--refs"), 10);
 
+        try
+        {
+            var result = QueryRepository(query, indexFile, limit);
+
+            if (format == "json")
+            {
+                Console.WriteLine(JsonSerializer.Serialize(result, WriteJson));
+            }
+            else
+            {
+                Console.Write(RenderMarkdown(result, refLimit));
+            }
+
+            return 0;
+        }
+        catch (FileNotFoundException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    internal static QueryResult QueryRepository(
+        string query,
+        string indexFile,
+        int limit)
+    {
         if (!File.Exists(indexFile))
         {
-            Console.Error.WriteLine($"index not found: {indexFile}");
-            return 1;
+            throw new FileNotFoundException($"index not found: {indexFile}", indexFile);
         }
 
         var document = JsonSerializer.Deserialize<IndexDocument>(File.ReadAllText(indexFile), ReadJson)
@@ -123,16 +169,7 @@ public static class Program
             .Select(symbol => new SymbolMatch(symbol, ConnectedEdges(symbol, edges)))
             .ToList();
 
-        if (format == "json")
-        {
-            Console.WriteLine(JsonSerializer.Serialize(new QueryResult(query, matches), WriteJson));
-        }
-        else
-        {
-            PrintMarkdown(query, matches, refLimit);
-        }
-
-        return 0;
+        return new QueryResult(query, matches);
     }
 
     private static IndexResult? RunTsIndexer(string script, string root)
@@ -207,7 +244,7 @@ public static class Program
         }
     }
 
-    private static string? FindTsIndexer()
+    internal static string? FindTsIndexer()
     {
         var candidates = new[]
         {
@@ -318,25 +355,26 @@ public static class Program
             .ThenBy(e => e.Line)
             .ToList();
 
-    private static void PrintMarkdown(string query, List<SymbolMatch> matches, int refLimit)
+    internal static string RenderMarkdown(QueryResult result, int refLimit)
     {
-        Console.WriteLine($"# Results for `{query}`");
-        if (matches.Count == 0)
+        using var writer = new StringWriter();
+        writer.WriteLine($"# Results for `{result.Query}`");
+        if (result.Matches.Count == 0)
         {
-            Console.WriteLine("No symbols found.");
-            return;
+            writer.WriteLine("No symbols found.");
+            return writer.ToString();
         }
 
-        foreach (var match in matches)
+        foreach (var match in result.Matches)
         {
-            Console.WriteLine();
-            Console.WriteLine($"## {match.Symbol.Name} ({match.Symbol.Kind}) — {match.Symbol.File}:{match.Symbol.Line}");
-            Console.WriteLine($"- `language` {match.Symbol.Language}");
-            Console.WriteLine($"- `qualifiedName` {match.Symbol.QualifiedName}");
-            Console.WriteLine($"- `signature` {match.Symbol.Signature}");
-            Console.WriteLine("```");
-            Console.WriteLine(match.Symbol.Snippet);
-            Console.WriteLine("```");
+            writer.WriteLine();
+            writer.WriteLine($"## {match.Symbol.Name} ({match.Symbol.Kind}) — {match.Symbol.File}:{match.Symbol.Line}");
+            writer.WriteLine($"- `language` {match.Symbol.Language}");
+            writer.WriteLine($"- `qualifiedName` {match.Symbol.QualifiedName}");
+            writer.WriteLine($"- `signature` {match.Symbol.Signature}");
+            writer.WriteLine("```");
+            writer.WriteLine(match.Symbol.Snippet);
+            writer.WriteLine("```");
 
             var groups = new (string Heading, List<SymbolEdge> Edges)[]
             {
@@ -364,13 +402,15 @@ public static class Program
                     continue;
                 }
 
-                Console.WriteLine($"**{group.Heading}** ({Math.Min(group.Edges.Count, refLimit)})");
+                writer.WriteLine($"**{group.Heading}** ({Math.Min(group.Edges.Count, refLimit)})");
                 foreach (var edge in group.Edges.Take(refLimit))
                 {
-                    Console.WriteLine($"- {edge.File}:{edge.Line} {FirstLine(edge.Snippet)}");
+                    writer.WriteLine($"- {edge.File}:{edge.Line} {FirstLine(edge.Snippet)}");
                 }
             }
         }
+
+        return writer.ToString();
     }
 
     private static string FirstLine(string text) => text.Replace('\r', ' ').Replace('\n', ' ').Trim();
@@ -620,6 +660,7 @@ public sealed record SymbolEdge(
     string Snippet);
 public sealed record IndexResult(List<SymbolDef> Symbols, List<SymbolEdge> Edges);
 public sealed record IndexDocument(int Version, List<SymbolDef>? Symbols, List<SymbolEdge>? Edges);
+public sealed record IndexSummary(string Output, int SymbolCount, int EdgeCount);
 public sealed record SymbolMatch(SymbolDef Symbol, List<SymbolEdge> Edges);
 public sealed record QueryResult(string Query, List<SymbolMatch> Matches);
 
