@@ -39,6 +39,8 @@ Guidance for contributing to **garf**, a minimal code indexer that scans a repos
 - `dotnet run --project src\Garf.Indexer -- mcp` — starts the local MCP stdio server.
 - `dotnet run --project src\Garf.Indexer -- selftest` — runs the built-in C# indexer check.
 - `cd ts-indexer; npm install` — installs the TypeScript dependency for JS/TS indexing.
+- `powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Runtime win-x64` — packages self-contained single-file release zip into `dist/`.
+- `powershell -ExecutionPolicy Bypass -File install.ps1` — installs Garf to `~/.garf/bin` and adds to user PATH.
 
 ## Coding Style & Naming Conventions
 

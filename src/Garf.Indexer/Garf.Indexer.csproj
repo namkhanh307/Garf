@@ -8,6 +8,8 @@
     <AssemblyName>garf</AssemblyName>
     <RootNamespace>Garf.Indexer</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <Version>0.1.0</Version>
+    <Description>Minimal code indexer for LLM token reduction</Description>
   </PropertyGroup>
 
   <PropertyGroup>

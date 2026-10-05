@@ -41,8 +41,16 @@ public static class Program
             "query" => RunQuery(args[1..]),
             "mcp" => McpServer.Run(),
             "selftest" => RunSelfTest(),
+            "--version" or "-v" or "version" => PrintVersion(),
             _ => Usage()
         };
+    }
+
+    private static int PrintVersion()
+    {
+        var version = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.1.0";
+        Console.WriteLine($"garf {version}");
+        return 0;
     }
 
     private static int Usage()
@@ -285,14 +293,33 @@ public static class Program
 
     internal static string? FindTsIndexer()
     {
-        var candidates = new[]
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var garfHome = Environment.GetEnvironmentVariable("GARF_HOME");
+
+        var candidates = new List<string?>
         {
             Path.Combine(AppContext.BaseDirectory, "ts-indexer", "index.mjs"),
+            Path.Combine(AppContext.BaseDirectory, "..", "ts-indexer", "index.mjs"),
             Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "ts-indexer", "index.mjs")),
             Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "ts-indexer", "index.mjs"))
         };
 
-        return candidates.FirstOrDefault(File.Exists);
+        if (!string.IsNullOrWhiteSpace(garfHome))
+        {
+            candidates.Add(Path.Combine(garfHome, "ts-indexer", "index.mjs"));
+            candidates.Add(Path.Combine(garfHome, "bin", "ts-indexer", "index.mjs"));
+        }
+
+        if (!string.IsNullOrWhiteSpace(userProfile))
+        {
+            candidates.Add(Path.Combine(userProfile, ".garf", "ts-indexer", "index.mjs"));
+            candidates.Add(Path.Combine(userProfile, ".garf", "bin", "ts-indexer", "index.mjs"));
+        }
+
+        return candidates
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .Select(c => Path.GetFullPath(c!))
+            .FirstOrDefault(File.Exists);
     }
 
     private static string[] Crawl(string root, string[] extensions)
