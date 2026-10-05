@@ -26,9 +26,6 @@ jobs:
           - os: macos-latest
             runtime: osx-arm64
             archive: garf-macos-arm64.tar.gz
-          - os: macos-13
-            runtime: osx-x64
-            archive: garf-macos-x64.tar.gz
 
     steps:
       - name: Checkout repository
