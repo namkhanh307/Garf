@@ -48,54 +48,96 @@ try {
         }
         $AssetFileName = "garf-windows-x64.zip"
 
-        $ReleaseUrl = if ($Version -eq "latest") {
-            "https://api.github.com/repos/$Repo/releases/latest"
+        # Attempt direct release download first (fastest, avoids API rate limits)
+        $DirectDownloadUrl = if ($Version -eq "latest") {
+            "https://github.com/$Repo/releases/latest/download/$AssetFileName"
         } else {
-            "https://api.github.com/repos/$Repo/releases/tags/$Version"
+            "https://github.com/$Repo/releases/download/$Version/$AssetFileName"
         }
 
-        Write-Host "==> Checking release from $ReleaseUrl ..." -ForegroundColor Cyan
-        
-        $DownloadUrl = $null
+        Write-Host "==> Checking release asset at $DirectDownloadUrl ..." -ForegroundColor Cyan
         try {
-            $headers = @{ "User-Agent" = "garf-installer" }
-            $releaseJson = Invoke-RestMethod -Uri $ReleaseUrl -Headers $headers -Method Get -TimeoutSec 15
-            $asset = $releaseJson.assets | Where-Object { $_.name -eq $AssetFileName }
-            if ($asset) {
-                $DownloadUrl = $asset.browser_download_url
-            }
+            Invoke-WebRequest -Uri $DirectDownloadUrl -OutFile $TempZip -UseBasicParsing -TimeoutSec 15
+            Write-Host "==> Successfully downloaded release asset from GitHub." -ForegroundColor Green
         }
         catch {
-            Write-Warning "Could not retrieve release info from GitHub ($($_.Exception.Message))."
+            Write-Warning "Direct release asset download unavailable ($($_.Exception.Message))."
         }
 
-        if ($DownloadUrl) {
-            Write-Host "==> Downloading $AssetFileName from GitHub Release ($($releaseJson.tag_name)) ..." -ForegroundColor Cyan
-            Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip -UseBasicParsing
+        if (-not (Test-Path $TempZip)) {
+            # Try GitHub API release query
+            $ReleaseApiUrl = if ($Version -eq "latest") {
+                "https://api.github.com/repos/$Repo/releases/latest"
+            } else {
+                "https://api.github.com/repos/$Repo/releases/tags/$Version"
+            }
+
+            try {
+                $headers = @{ "User-Agent" = "garf-installer" }
+                $releaseJson = Invoke-RestMethod -Uri $ReleaseApiUrl -Headers $headers -Method Get -TimeoutSec 15
+                $asset = $releaseJson.assets | Where-Object { $_.name -eq $AssetFileName }
+                if ($asset -and $asset.browser_download_url) {
+                    Write-Host "==> Downloading $AssetFileName from release ($($releaseJson.tag_name)) ..." -ForegroundColor Cyan
+                    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $TempZip -UseBasicParsing
+                }
+            }
+            catch {
+                Write-Warning "GitHub API query also failed ($($_.Exception.Message))."
+            }
         }
-        else {
-            # Fallback: check if local distribution zip exists in current dir
+
+        # Fallback 1: Local repository if run from repo folder
+        if (-not (Test-Path $TempZip)) {
             $CandidateLocalZip = Join-Path (Get-Location) "dist\$AssetFileName"
             if (Test-Path $CandidateLocalZip) {
                 Write-Host "==> Found local distribution archive: $CandidateLocalZip" -ForegroundColor Yellow
                 Copy-Item -Path $CandidateLocalZip -Destination $TempZip -Force
             }
-            elseif (Get-Command dotnet -ErrorAction SilentlyContinue) {
-                Write-Host "==> Remote release asset not found. Building locally via .NET SDK fallback ..." -ForegroundColor Yellow
-                $Csproj = Join-Path (Get-Location) "src\Garf.Indexer\Garf.Indexer.csproj"
-                if (Test-Path $Csproj) {
-                    $PackageScript = Join-Path (Get-Location) "scripts\package.ps1"
-                    if (Test-Path $PackageScript) {
-                        & powershell -ExecutionPolicy Bypass -File $PackageScript -OutputDir "dist"
-                        $BuiltZip = Join-Path (Get-Location) "dist\$AssetFileName"
+            elseif ((Test-Path (Join-Path (Get-Location) "src\Garf.Indexer\Garf.Indexer.csproj")) -and (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+                Write-Host "==> Compiling from local repository clone ..." -ForegroundColor Yellow
+                $PackageScript = Join-Path (Get-Location) "scripts\package.ps1"
+                if (Test-Path $PackageScript) {
+                    & powershell -ExecutionPolicy Bypass -File $PackageScript -OutputDir "dist"
+                    $BuiltZip = Join-Path (Get-Location) "dist\$AssetFileName"
+                    if (Test-Path $BuiltZip) {
                         Copy-Item -Path $BuiltZip -Destination $TempZip -Force
                     }
                 }
             }
+        }
 
-            if (-not (Test-Path $TempZip)) {
-                throw "Unable to download release asset '$AssetFileName' from $Repo, and no local fallback archive was found."
+        # Fallback 2: Download source zip from GitHub and compile with local dotnet SDK
+        if (-not (Test-Path $TempZip) -and (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+            Write-Host "==> Release asset not yet published on GitHub. Downloading source archive to compile with local .NET SDK fallback ..." -ForegroundColor Yellow
+            $SourceZipUrl = "https://github.com/$Repo/archive/refs/heads/main.zip"
+            $TempSourceZip = Join-Path $env:TEMP "garf-source-$([Guid]::NewGuid().ToString('N')).zip"
+            $TempSourceDir = Join-Path $env:TEMP "garf-source-extract-$([Guid]::NewGuid().ToString('N'))"
+            try {
+                Invoke-WebRequest -Uri $SourceZipUrl -OutFile $TempSourceZip -UseBasicParsing
+                Expand-Archive -Path $TempSourceZip -DestinationPath $TempSourceDir -Force
+                $ExtractedRoot = Get-ChildItem -Path $TempSourceDir -Directory | Select-Object -First 1
+                if ($ExtractedRoot) {
+                    $TempPackageScript = Join-Path $ExtractedRoot.FullName "scripts\package.ps1"
+                    if (Test-Path $TempPackageScript) {
+                        & powershell -ExecutionPolicy Bypass -File $TempPackageScript -OutputDir "dist"
+                        $BuiltZip = Join-Path $ExtractedRoot.FullName "dist\$AssetFileName"
+                        if (Test-Path $BuiltZip) {
+                            Copy-Item -Path $BuiltZip -Destination $TempZip -Force
+                        }
+                    }
+                }
             }
+            catch {
+                Write-Warning "Source compilation fallback failed: $($_.Exception.Message)"
+            }
+            finally {
+                if (Test-Path $TempSourceZip) { Remove-Item -Force $TempSourceZip -ErrorAction SilentlyContinue }
+                if (Test-Path $TempSourceDir) { Remove-Item -Recurse -Force $TempSourceDir -ErrorAction SilentlyContinue }
+            }
+        }
+
+        if (-not (Test-Path $TempZip)) {
+            throw "Unable to download prebuilt binary '$AssetFileName' from $Repo (release may still be building on GitHub Actions), and no local fallback could be used. Check: https://github.com/$Repo/releases"
         }
     }
 
